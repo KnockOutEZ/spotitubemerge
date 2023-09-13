@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"time"
 
+	"github.com/hibiken/asynq"
 	"github.com/labstack/echo/v4"
 	"github.com/nexentra/spotitubemerge/internal/middleware"
 	"github.com/nexentra/spotitubemerge/internal/yt_playlist"
@@ -15,15 +17,17 @@ import (
 	spotifyauth "github.com/zmb3/spotify/v2/auth"
 	"golang.org/x/oauth2"
 	"google.golang.org/api/youtube/v3"
+	"github.com/isacikgoz/slices"
 )
 
-func RegisterHandlers(r *echo.Group, authenticator *spotifyauth.Authenticator, config *oauth2.Config, errorLog *log.Logger, infoLog *log.Logger, env map[string]string, redisClient *redis.Client) {
+func RegisterHandlers(r *echo.Group, authenticator *spotifyauth.Authenticator, config *oauth2.Config, errorLog *log.Logger, infoLog *log.Logger, env map[string]string, redisClient *redis.Client, asynqClient *asynq.Client) {
 	res := &Resource{
 		Authenticator: authenticator,
 		ErrorLog:      errorLog,
 		InfoLog:       infoLog,
 		Env:           env,
 		RedisClient:   redisClient,
+		AsynqClient:   asynqClient,
 	}
 
 	resConfig := middleware.Resource{
@@ -32,6 +36,10 @@ func RegisterHandlers(r *echo.Group, authenticator *spotifyauth.Authenticator, c
 
 	r.POST("/merge-yt-spotify", res.mergeYtSpotify, resConfig.GenerateYoutubeClient)
 }
+
+const (
+	TypeYoutubeItemsAdding = "youtube:items"
+)
 
 type MergerList struct {
 	YoutubePlaylists []string `json:"youtube-playlists"`
@@ -44,6 +52,7 @@ type Resource struct {
 	InfoLog       *log.Logger
 	Env           map[string]string
 	RedisClient   *redis.Client
+	AsynqClient   *asynq.Client
 }
 
 type AllYoutubeItems struct {
@@ -71,7 +80,7 @@ func (r *Resource) mergeYtSpotify(c echo.Context) error {
 	}
 
 	//get spotify items
-	allSpotifyTitles,err := r.getAllSpotifyItems(c, mergerList, spotifyClient)
+	allSpotifyTitles, err := r.getAllSpotifyItems(c, mergerList, spotifyClient)
 	if err != nil {
 		r.ErrorLog.Printf("Failed task: %v", err)
 	}
@@ -82,9 +91,8 @@ func (r *Resource) mergeYtSpotify(c echo.Context) error {
 		r.ErrorLog.Printf("Failed task: %v", err)
 	}
 
-
 	// Get YouTube items
-	allYoutubeTitles,err := r.getAllYoutubeItems(mergerList, service)
+	allYoutubeTitles, err := r.getAllYoutubeItems(mergerList, service)
 	if err != nil {
 		r.ErrorLog.Printf("Failed task: %v", err)
 	}
@@ -102,13 +110,13 @@ func (r *Resource) mergeYtSpotify(c echo.Context) error {
 	}
 
 	// Add tracks to the spotify playlist
-	err = r.addTracksToSpotifyPlaylist(allYoutubeTitles,spotifyClient, newSpotifyPlaylist, ytClient,newYoutubePlaylist)
+	err = r.addTracksToSpotifyPlaylist(&allYoutubeTitles, spotifyClient, newSpotifyPlaylist, ytClient, newYoutubePlaylist)
 	if err != nil {
 		r.ErrorLog.Printf("Failed task: %v", err)
 	}
 
 	//Add tracks to the youtube playlist
-	err = r.addTracksToYoutubePlaylist(allSpotifyTitles,spotifyClient, newSpotifyPlaylist, ytClient,newYoutubePlaylist)
+	err = r.addTracksToYoutubePlaylist(&allSpotifyTitles, spotifyClient, newSpotifyPlaylist, ytClient, newYoutubePlaylist)
 	if err != nil {
 		r.ErrorLog.Printf("Failed task: %v", err)
 	}
@@ -128,10 +136,10 @@ func getAuthHeaders(c echo.Context) (*oauth2.Token, *oauth2.Token, error) {
 	if authHeaderTypeSpotify == nil || authHeaderTypeYoutube == nil {
 		return nil, nil, fmt.Errorf("no auth header")
 	}
-	return authHeaderTypeSpotify, authHeaderTypeYoutube , nil
+	return authHeaderTypeSpotify, authHeaderTypeYoutube, nil
 }
 
-func (r *Resource) createSpotifyClientAndUser(c echo.Context, authHeaderTypeSpotify *oauth2.Token) (*spotify.Client, *spotify.PrivateUser, error){
+func (r *Resource) createSpotifyClientAndUser(c echo.Context, authHeaderTypeSpotify *oauth2.Token) (*spotify.Client, *spotify.PrivateUser, error) {
 	spotifyClient := spotify.New(r.Authenticator.Client(c.Request().Context(), authHeaderTypeSpotify))
 
 	//get spotify user
@@ -143,7 +151,7 @@ func (r *Resource) createSpotifyClientAndUser(c echo.Context, authHeaderTypeSpot
 	return spotifyClient, user, err
 }
 
-func (r *Resource) getAllSpotifyItems(c echo.Context, mergerList MergerList, spotifyClient *spotify.Client)([]spotify.PlaylistItemTrack, error){
+func (r *Resource) getAllSpotifyItems(c echo.Context, mergerList MergerList, spotifyClient *spotify.Client) ([]spotify.PlaylistItemTrack, error) {
 	var allSpotifyTitles []spotify.PlaylistItemTrack
 	for _, playlist := range mergerList.SpotifyPlaylists {
 		playlistItems, err := spotifyClient.GetPlaylistItems(c.Request().Context(), spotify.ID(playlist))
@@ -163,11 +171,10 @@ func (r *Resource) getAllSpotifyItems(c echo.Context, mergerList MergerList, spo
 		fmt.Println("title: ", title.Track.Name)
 	}
 
-	
 	return allSpotifyTitles, nil
 }
 
-func (r *Resource) createYoutubeClientAndService(c echo.Context)(*http.Client, *youtube.Service, error){
+func (r *Resource) createYoutubeClientAndService(c echo.Context) (*http.Client, *youtube.Service, error) {
 	ytClient := c.Get("client").(*http.Client)
 	service, err := youtube.New(ytClient)
 	if err != nil {
@@ -177,7 +184,7 @@ func (r *Resource) createYoutubeClientAndService(c echo.Context)(*http.Client, *
 	return ytClient, service, err
 }
 
-func (r *Resource) getAllYoutubeItems(mergerList MergerList, service *youtube.Service)([]AllYoutubeItems, error){
+func (r *Resource) getAllYoutubeItems(mergerList MergerList, service *youtube.Service) ([]AllYoutubeItems, error) {
 	var allYoutubeTitles []AllYoutubeItems
 	for _, playlist := range mergerList.YoutubePlaylists {
 		call := service.PlaylistItems.List([]string{"snippet"}).
@@ -211,10 +218,19 @@ func (r *Resource) getAllYoutubeItems(mergerList MergerList, service *youtube.Se
 	return allYoutubeTitles, nil
 }
 
-func (r *Resource) addTracksToSpotifyPlaylist(allYoutubeTitles []AllYoutubeItems,spotifyClient *spotify.Client, newSpotifyPlaylist *spotify.FullPlaylist, ytClient *http.Client,newYoutubePlaylist *youtube.Playlist ) error {
-	for i, items := range allYoutubeTitles {
+func (r *Resource) addTracksToSpotifyPlaylist(allYoutubeTitles *[]AllYoutubeItems, spotifyClient *spotify.Client, newSpotifyPlaylist *spotify.FullPlaylist, ytClient *http.Client, newYoutubePlaylist *youtube.Playlist) error {
+	fmt.Println("allYoutubeTitles: ", *allYoutubeTitles)
+	if len(*allYoutubeTitles) == 0 {
+		return nil
+	}
+	youtubeTitleSlice := *allYoutubeTitles
+	// youtubeTitleSlice := make([]AllYoutubeItems, len(*allYoutubeTitles))
+	// copy(youtubeTitleSlice, *allYoutubeTitles)
+	for i, items := range *allYoutubeTitles {
 		fmt.Println("index: ", i)
+		fmt.Println("index: ", len(*allYoutubeTitles))
 		fmt.Println("title: ", items.Title)
+		
 
 		// Search for the video in Spotify
 		results, err := spotifyClient.Search(context.Background(), items.Title, spotify.SearchTypeTrack)
@@ -245,13 +261,52 @@ func (r *Resource) addTracksToSpotifyPlaylist(allYoutubeTitles []AllYoutubeItems
 		} else {
 			fmt.Println("Track added to playlist:", items.Title)
 		}
+
+		if len(youtubeTitleSlice) > 0 {
+			youtubeTitleSlice = slices.Delete(youtubeTitleSlice, i)
+		}
+		
+		fmt.Println("youtubeTitleSlice222: ", youtubeTitleSlice)
+	}
+	fmt.Println("youtubeTitleSlice111: ", youtubeTitleSlice)
+	if len(youtubeTitleSlice) > 0 {
+		info, err := r.AsynqClient.Enqueue(NewAddTracksToYoutubePlaylistTask(youtubeTitleSlice, ytClient, newYoutubePlaylist), asynq.Queue("low"), asynq.ProcessIn(20*time.Second))
+		if err != nil {
+			log.Fatalf("could not schedule task: %v", err)
+		}
+		log.Printf("enqueued task: id=%s queue=%s timeout=%s", info.ID, info.Queue, info.Timeout)
 	}
 
 	return nil
 }
 
-func (r *Resource) addTracksToYoutubePlaylist(allSpotifyTitles []spotify.PlaylistItemTrack,spotifyClient *spotify.Client, newSpotifyPlaylist *spotify.FullPlaylist, ytClient *http.Client,newYoutubePlaylist *youtube.Playlist ) error {
-	for i, title := range allSpotifyTitles {
+func NewAddTracksToYoutubePlaylistTask(youtubeTitleSlice []AllYoutubeItems, ytClient *http.Client, newYoutubePlaylist *youtube.Playlist) *asynq.Task {
+	fmt.Println("I am from queue: ")
+	fmt.Println("youtubeTitleSlice333: ", youtubeTitleSlice)
+	for i, items := range youtubeTitleSlice {
+		fmt.Println("index: ", i)
+		fmt.Println("title: ", items.Title)
+
+		// Add the video to the youtube playlist
+		err := ytplaylist.AddVideoToPlaylist(ytClient, newYoutubePlaylist.Id, items.Id)
+		if err != nil {
+			fmt.Println("Error adding video to playlist: ", err)
+		} else {
+			fmt.Println("Track added to playlist:", items.Title)
+		}
+		// youtubeTitleSlice = RemoveFromSlice1(youtubeTitleSlice, i)
+		fmt.Println("youtubeTitleSlice333: ", youtubeTitleSlice)
+	}
+	return asynq.NewTask(TypeYoutubeItemsAdding, nil, asynq.MaxRetry(10), asynq.Timeout(3 * time.Minute))
+}
+
+func (r *Resource) addTracksToYoutubePlaylist(allSpotifyTitles *[]spotify.PlaylistItemTrack, spotifyClient *spotify.Client, newSpotifyPlaylist *spotify.FullPlaylist, ytClient *http.Client, newYoutubePlaylist *youtube.Playlist) error {
+	fmt.Println("allSpotifyTitles: ", *allSpotifyTitles)
+	if len(*allSpotifyTitles) == 0 {
+		return nil
+	}
+	spotifyTitleSlice := *allSpotifyTitles
+	for i, title := range *allSpotifyTitles {
 		fmt.Println("index: ", i)
 		fmt.Println("title: ", title.Track.Artists[0].Name)
 		// Add the track to the newly created playlist
@@ -276,7 +331,12 @@ func (r *Resource) addTracksToYoutubePlaylist(allSpotifyTitles []spotify.Playlis
 		} else {
 			fmt.Println("Video added to YouTube playlist:", title.Track.Name)
 		}
+		// if len(spotifyTitleSlice) > 0 {
+		// 	fmt.Println("spotifyTitleSlice: ", spotifyTitleSlice)
+		// 	spotifyTitleSlice = slices.Delete(spotifyTitleSlice, i)
+		// }
+		fmt.Println("allSpotifyTitles222: ", spotifyTitleSlice)
 	}
-
+	fmt.Println("allSpotifyTitles111: ", *allSpotifyTitles)
 	return nil
 }

@@ -8,6 +8,7 @@ import (
 	"os"
 	"strconv"
 
+	"github.com/hibiken/asynq"
 	"github.com/joho/godotenv"
 	"github.com/nexentra/spotitubemerge/internal/models"
 	"github.com/redis/go-redis/v9"
@@ -23,6 +24,7 @@ type Application struct {
 	Youtube     *models.YoutubeModel
 	Env         map[string]string
 	RedisClient *redis.Client
+	AsynqClient *asynq.Client
 }
 
 type configType struct {
@@ -34,7 +36,7 @@ func main() {
 	if err != nil {
 		log.Fatal("Error loading .env file")
 	}
-	
+
 	var cfg configType
 	var errorLog *log.Logger
 	var infoLog *log.Logger
@@ -93,10 +95,10 @@ func main() {
 	var redirectUri string = envFile["SPOTIFY_REDIRECT_URI"]
 
 	rdb := redis.NewClient(&redis.Options{
-        Addr:     envFile["REDIS_ADDR"],
-        Password: envFile["REDIS_PASSWORD"],
-        DB:       0,
-    })
+		Addr:     envFile["REDIS_ADDR"],
+		Password: envFile["REDIS_PASSWORD"],
+		DB:       0,
+	})
 
 	authenticator := spotifyauth.New(
 		spotifyauth.WithRedirectURL(redirectUri),
@@ -111,6 +113,13 @@ func main() {
 		spotifyauth.WithClientSecret(envFile["SPOTIFY_CLIENT_SECRET"]),
 	)
 
+	asynqClient := asynq.NewClient(asynq.RedisClientOpt{
+		Addr:     envFile["REDIS_ADDR"],
+		Password: envFile["REDIS_PASSWORD"],
+		DB:       0,
+	})
+	defer asynqClient.Close()
+
 	application := &Application{
 		ErrorLog: errorLog,
 		InfoLog:  infoLog,
@@ -122,8 +131,9 @@ func main() {
 			Config: config,
 			State:  envFile["YOUTUBE_STATE"],
 		},
-		Env: envFile,
+		Env:         envFile,
 		RedisClient: rdb,
+		AsynqClient: asynqClient,
 	}
 
 	mux := http.NewServeMux()
